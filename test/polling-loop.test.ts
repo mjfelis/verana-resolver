@@ -297,4 +297,145 @@ describe('pollOnce', () => {
     expect(result.didsAffected).toBe(0);
     expect(mockIndexer.listChanges).not.toHaveBeenCalled();
   });
+
+  it('fast-forwards across empty ranges using next_change_at', async () => {
+    const { pollOnce } = await import('../src/polling/polling-loop.js');
+    const { getLastProcessedBlock, setLastProcessedBlock } = await import('../src/polling/resolver-state.js');
+    const { cleanupExpiredRetries } = await import('../src/polling/reattemptable.js');
+    const { runVerrePass } = await import('../src/polling/verre-pass.js');
+
+    // Resolver is at block 803_599 ; chain head is 883_490 (next activity).
+    // Empty range = 79_891 blocks. Without the optimization the resolver
+    // would issue 79_891 listChanges calls; with it, exactly two.
+    vi.mocked(getLastProcessedBlock).mockResolvedValue(803_599);
+    vi.mocked(cleanupExpiredRetries).mockResolvedValue([]);
+
+    const mockIndexer = {
+      getBlockHeight: vi.fn().mockResolvedValue({ height: 883_490 }),
+      listChanges: vi.fn()
+        // First call: block 803_600 has no activity, indexer points at 883_490.
+        .mockResolvedValueOnce({
+          block_height: 803_600,
+          next_change_at: 883_490,
+          activity: [],
+        })
+        // After fast-forward, the loop targets 883_490 and finds activity.
+        .mockResolvedValueOnce({
+          block_height: 883_490,
+          activity: [{
+            timestamp: '2026-04-28T00:00:00Z',
+            block_height: '883490',
+            entity_type: 'Permission',
+            entity_id: '1',
+            account: 'verana1abc',
+            msg: 'MsgCreatePermission',
+            changes: { did: 'did:web:test.example.com' },
+          }],
+        }),
+      clearMemo: vi.fn(),
+    } as any;
+
+    const config = {
+      POLL_INTERVAL: 5,
+      TRUST_TTL: 3600,
+      TRUST_TTL_REFRESH_RATIO: 0.2,
+      POLL_OBJECT_CACHING_RETRY_DAYS: 7,
+      ECS_ECOSYSTEM_DIDS: 'did:web:ecosystem.example.com',
+      VPR_REGISTRIES: '[]',
+      DISABLE_DIGEST_SRI_VERIFICATION: false,
+    } as any;
+
+    const result = await pollOnce(mockIndexer, config);
+
+    // Exactly two indexer round-trips: one for the empty block + one for the next-change block.
+    expect(mockIndexer.listChanges).toHaveBeenCalledTimes(2);
+    expect(mockIndexer.listChanges).toHaveBeenNthCalledWith(1, 803_600);
+    expect(mockIndexer.listChanges).toHaveBeenNthCalledWith(2, 883_490);
+
+    // After the fast-forward, lastProcessedBlock jumps to next_change_at - 1 = 883_489,
+    // then is updated to 883_490 once that block is processed.
+    expect(setLastProcessedBlock).toHaveBeenCalledWith(883_489);
+    expect(setLastProcessedBlock).toHaveBeenLastCalledWith(883_490);
+
+    // Verre pass runs only for the block that actually has activity.
+    expect(runVerrePass).toHaveBeenCalledTimes(1);
+
+    // 1 fast-forward + 1 real block = 2 blocksProcessed.
+    expect(result.blocksProcessed).toBe(2);
+    expect(result.didsAffected).toBeGreaterThanOrEqual(1);
+  });
+
+  it('clamps next_change_at to indexerHeight when the hint points past the head', async () => {
+    const { pollOnce } = await import('../src/polling/polling-loop.js');
+    const { getLastProcessedBlock, setLastProcessedBlock } = await import('../src/polling/resolver-state.js');
+    const { cleanupExpiredRetries } = await import('../src/polling/reattemptable.js');
+
+    // Resolver at 100, indexer head is 200, but indexer claims next_change_at = 1_000_000
+    // (e.g. nothing in [101, 200] either). We must clamp to 200, not jump to 999_999.
+    vi.mocked(getLastProcessedBlock).mockResolvedValue(100);
+    vi.mocked(cleanupExpiredRetries).mockResolvedValue([]);
+
+    const mockIndexer = {
+      getBlockHeight: vi.fn().mockResolvedValue({ height: 200 }),
+      listChanges: vi.fn().mockResolvedValueOnce({
+        block_height: 101,
+        next_change_at: 1_000_000,
+        activity: [],
+      }),
+      clearMemo: vi.fn(),
+    } as any;
+
+    const config = {
+      POLL_INTERVAL: 5,
+      TRUST_TTL: 3600,
+      TRUST_TTL_REFRESH_RATIO: 0.2,
+      POLL_OBJECT_CACHING_RETRY_DAYS: 7,
+      ECS_ECOSYSTEM_DIDS: 'did:web:ecosystem.example.com',
+      VPR_REGISTRIES: '[]',
+      DISABLE_DIGEST_SRI_VERIFICATION: false,
+    } as any;
+
+    const result = await pollOnce(mockIndexer, config);
+
+    // We clamp: jump to indexerHeight (200), not to 999_999.
+    expect(setLastProcessedBlock).toHaveBeenCalledWith(200);
+    // After lastBlock = 200 == indexerHeight, the while-loop exits — no second listChanges call.
+    expect(mockIndexer.listChanges).toHaveBeenCalledTimes(1);
+    expect(result.blocksProcessed).toBe(1);
+  });
+
+  it('falls back to one-by-one processing when next_change_at is absent (legacy indexer)', async () => {
+    const { pollOnce } = await import('../src/polling/polling-loop.js');
+    const { getLastProcessedBlock } = await import('../src/polling/resolver-state.js');
+    const { cleanupExpiredRetries } = await import('../src/polling/reattemptable.js');
+
+    vi.mocked(getLastProcessedBlock).mockResolvedValue(99);
+    vi.mocked(cleanupExpiredRetries).mockResolvedValue([]);
+
+    // Older indexer that does not surface next_change_at — the resolver
+    // walks blocks one by one as before.
+    const mockIndexer = {
+      getBlockHeight: vi.fn().mockResolvedValue({ height: 102 }),
+      listChanges: vi.fn()
+        .mockResolvedValueOnce({ block_height: 100, activity: [] })
+        .mockResolvedValueOnce({ block_height: 101, activity: [] })
+        .mockResolvedValueOnce({ block_height: 102, activity: [] }),
+      clearMemo: vi.fn(),
+    } as any;
+
+    const config = {
+      POLL_INTERVAL: 5,
+      TRUST_TTL: 3600,
+      TRUST_TTL_REFRESH_RATIO: 0.2,
+      POLL_OBJECT_CACHING_RETRY_DAYS: 7,
+      ECS_ECOSYSTEM_DIDS: 'did:web:ecosystem.example.com',
+      VPR_REGISTRIES: '[]',
+      DISABLE_DIGEST_SRI_VERIFICATION: false,
+    } as any;
+
+    const result = await pollOnce(mockIndexer, config);
+
+    expect(mockIndexer.listChanges).toHaveBeenCalledTimes(3);
+    expect(result.blocksProcessed).toBe(3);
+  });
 });
