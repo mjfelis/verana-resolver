@@ -12,6 +12,11 @@ permissions:
 
 jobs:
   release-please:
+    # Gate the inherited release-please + Docker-Hub / Helm pipeline to
+    # the canonical upstream repo. On a fork it would fail at the PR
+    # creation step (default fork settings disallow GitHub Actions from
+    # opening PRs) and at the docker login step (no DOCKER_HUB_* secrets).
+    if: github.repository == 'verana-labs/verana-resolver'
     runs-on: ubuntu-latest
     outputs:
       releases_created: ${{ steps.release.outputs.releases_created }}

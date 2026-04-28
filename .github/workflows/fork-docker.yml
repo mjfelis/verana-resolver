@@ -1,0 +1,123 @@
+name: Fork — build & push Docker image to ghcr.io
+
+# This workflow lives only on the fork-publish branch. It builds the
+# resolver container directly from this fork (which itself pulls
+# `@verana-labs/verre` from the matching mjfelis/verre fork via a
+# git URL in package.json) and pushes the image to GitHub Container
+# Registry under `ghcr.io/mjfelis/verana-resolver`.
+#
+# No external secrets are required — authentication uses the built-in
+# `GITHUB_TOKEN` that GitHub Actions provides automatically.
+
+on:
+  push:
+    branches:
+      - feat/fork-publish
+      - main
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Optional explicit tag (e.g. v0.3.0-fork.1). Defaults to <branch>-<sha>.'
+        required: false
+
+concurrency:
+  group: fork-docker-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository_owner }}/verana-resolver
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Sanity gate: typecheck + tests run before we build / push.
+      - name: Setup Node 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install (with build prerequisites)
+        run: |
+          # Same toolchain rationale as the Dockerfile: verre is pulled
+          # from a git URL and brings in native devDeps that need build
+          # tools. The Ubuntu runner has them by default, but we still
+          # require git for the clone (also default).
+          npm install
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Test
+        run: npm test
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute tags
+        id: tags
+        run: |
+          SHA=${GITHUB_SHA::7}
+          BRANCH_TAG=${GITHUB_REF_NAME//\//-}
+          BASE="${REGISTRY}/${IMAGE_NAME}"
+
+          TAGS=(
+            "${BASE}:${BRANCH_TAG}"
+            "${BASE}:${BRANCH_TAG}-${SHA}"
+            "${BASE}:sha-${SHA}"
+          )
+
+          # If the user dispatched the workflow with an explicit tag,
+          # add it to the list.
+          if [ -n "${{ github.event.inputs.tag }}" ]; then
+            TAGS+=("${BASE}:${{ github.event.inputs.tag }}")
+          fi
+
+          # Newline-join for the docker/build-push-action `tags:` input.
+          { echo 'tags<<EOF'; printf '%s\n' "${TAGS[@]}"; echo 'EOF'; } >> $GITHUB_OUTPUT
+
+          echo 'Computed image tags:'
+          printf '  %s\n' "${TAGS[@]}"
+
+      - name: Build & push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          push: true
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=Apache-2.0
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Publish summary
+        run: |
+          echo '## Pushed Docker images' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo '${{ steps.tags.outputs.tags }}' >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo 'Pull with:' >> $GITHUB_STEP_SUMMARY
+          echo '' >> $GITHUB_STEP_SUMMARY
+          echo '```bash' >> $GITHUB_STEP_SUMMARY
+          echo "docker pull ${REGISTRY}/${IMAGE_NAME}:${GITHUB_REF_NAME//\//-}" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY

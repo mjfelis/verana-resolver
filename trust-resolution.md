@@ -262,11 +262,29 @@ Given a DID and an optional point-in-time (ISO 8601 datetime or block height, de
       "uri": "https://acme-insurance.example.com/.well-known/vp/additional.jwt",
       "format": "W3C_VTC",
       "error": "Credential signature verification failed: invalid JWS",
-      "errorCode": "SIGNATURE_INVALID"
+      "errorCode": "VP_SIGNATURE_INVALID",
+      "serviceId": "did:web:acme-insurance.example.com#vpr-schemas-additional-c-vp",
+      "presentationType": "vtc"
     }
-  ]
+  ],
+  "dereferenceErrors": []
 }
 ```
+
+> **Per-VP / per-credential outcome accumulator (spec v4):**
+> - `failedCredentials[]` carries one entry per credential that failed
+>   validation, grouped by verre `errorCode`. Fine-grained codes now
+>   pinpoint the broken rule: `ISSUER_PERMISSION_MISSING`,
+>   `ISSUER_PERMISSION_NOT_EFFECTIVE`, `ECS_TRUST_REGISTRY_NOT_WHITELISTED`,
+>   `VP_SIGNATURE_INVALID`, `FRAGMENT_NOT_CONFORMANT`, etc.
+> - `dereferenceErrors[]` carries VP-level failures (the whole VP
+>   could not be processed — e.g. HTTP 404, bad signature, unknown
+>   fragment suffix). Each entry carries `serviceId`, `vpUrl`,
+>   `errorCode`, and `presentationType` (`vtc` or `vtjsc`).
+> - A single multi-credential VP whose credentials fail individually
+>   is NOT dropped as a whole — the passing credentials appear under
+>   `credentials[]` and the failing credentials appear under
+>   `failedCredentials[]` with the SAME `serviceId`.
 
 > **Design notes (Case A — VS-REQ-3):**
 > - This is the **VS-REQ-3** case: the VS itself presents both the `ECS-SERVICE` credential and an `ECS-ORG` credential. Both have `presentedBy` = the queried DID. The service is `TRUSTED` because both required ECS are satisfied.

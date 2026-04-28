@@ -6,6 +6,14 @@
 FROM node:22-alpine AS deps
 WORKDIR /app
 
+# Build prerequisites:
+#   - git: required to clone the @verana-labs/verre fork (the dep is
+#     pinned to a github:mjfelis/verre#feat/fork-publish git URL).
+#   - python3 / make / g++: required by verre's transitive Credo / Askar
+#     devDependencies (ref-napi, cpu-features) which run node-gyp during
+#     postinstall on Alpine.
+RUN apk add --no-cache git python3 make g++
+
 # Copy package files
 COPY package.json ./
 
@@ -41,10 +49,16 @@ ENV NODE_ENV=production
 RUN addgroup -S -g 1001 nodejs \
     && adduser -S -u 1001 -G nodejs resolver
 
-# Copy package files and install production-only dependencies
+# Copy package files and install production-only dependencies.
+# Same git/python3/make/g++ rationale as the deps stage — the
+# @verana-labs/verre prod dep is a git URL whose own postinstall +
+# prepare scripts need a build toolchain. Tools are removed in the
+# same RUN to keep the runner image slim.
 COPY --from=builder /app/package.json ./
 RUN --mount=type=cache,target=/root/.npm \
-    npm install --omit=dev
+    apk add --no-cache --virtual .build-deps git python3 make g++ \
+    && npm install --omit=dev \
+    && apk del .build-deps
 
 # Copy built application
 COPY --from=builder --chown=resolver:nodejs /app/dist ./dist
