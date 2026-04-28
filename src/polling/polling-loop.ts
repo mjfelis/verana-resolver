@@ -110,6 +110,26 @@ export async function pollOnce(
       // Fetch changes for this block
       const changes = await indexer.listChanges(target);
       const activity = changes.activity;
+
+      // Fast-forward across empty ranges: when this block has no activity
+      // and the indexer points at a future block via `next_change_at`,
+      // skip directly to (next_change_at - 1) instead of walking every
+      // empty block one-by-one. Clamp to the current indexer head so we
+      // never overshoot, and only skip when the jump is strictly forward.
+      if (activity.length === 0 && changes.next_change_at && changes.next_change_at > target) {
+        const skipTo = Math.min(changes.next_change_at - 1, indexerHeight);
+        if (skipTo > target) {
+          logger.info(
+            { from: target, to: skipTo, gap: skipTo - target + 1, nextChangeAt: changes.next_change_at },
+            'Fast-forwarding through empty blocks',
+          );
+          await setLastProcessedBlock(skipTo);
+          lastBlock = skipTo;
+          blocksProcessed++;
+          continue;
+        }
+      }
+
       const affectedDids = extractAffectedDids(activity);
 
       // Summarise activity per entity_type, e.g. { trust_registry: 2, credential_schema: 1 }

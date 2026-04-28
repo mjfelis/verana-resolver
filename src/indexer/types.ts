@@ -17,6 +17,12 @@ export interface ActivityItem {
 export interface ChangesResponse {
   block_height: number;
   activity: ActivityItem[];
+  // Hint from the indexer pointing at the next block height that has
+  // activity, when the requested block has none. The polling loop uses
+  // this to fast-forward across long empty ranges instead of walking
+  // every block one-by-one. Optional for backward compatibility with
+  // older indexer versions that do not surface the hint.
+  next_change_at?: number;
 }
 
 export interface TrustRegistryDocument {
