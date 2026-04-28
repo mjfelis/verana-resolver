@@ -1,6 +1,7 @@
 import {
   resolveDID as verreResolveDID,
   TrustResolutionOutcome,
+  TrustErrorCode,
   ECS,
   type VerifiablePublicRegistry,
   type TrustResolution,
@@ -9,6 +10,7 @@ import {
   type IOrg,
   type IPersona,
   type IUserAgent,
+  type VpOutcomeWithError,
 } from '@verana-labs/verre';
 import type { IndexerClient } from '../indexer/client.js';
 import { deleteCachedFile } from '../cache/file-cache.js';
@@ -19,6 +21,7 @@ import type {
   TrustStatus,
   CredentialEvaluation,
   FailedCredential,
+  VPDereferenceError,
   EcsType,
 } from '../trust/types.js';
 import { verreLogger } from '../trust/verre-logger.js';
@@ -56,11 +59,16 @@ function mapOutcomeToProduction(outcome: TrustResolutionOutcome, verified: boole
 
 function mapEcsType(schemaType: ICredential['schemaType']): EcsType {
   switch (schemaType) {
-    case ECS.SERVICE: return 'ECS-SERVICE';
-    case ECS.ORG: return 'ECS-ORG';
-    case ECS.PERSONA: return 'ECS-PERSONA';
-    case ECS.USER_AGENT: return 'ECS-UA';
-    default: return null;
+    case ECS.SERVICE:
+      return 'ECS-SERVICE';
+    case ECS.ORG:
+      return 'ECS-ORG';
+    case ECS.PERSONA:
+      return 'ECS-PERSONA';
+    case ECS.USER_AGENT:
+      return 'ECS-UA';
+    default:
+      return null;
   }
 }
 
@@ -117,12 +125,9 @@ function extractClaimsFromCredential(cred: ICredential): Record<string, unknown>
   return claims;
 }
 
-function credentialToEvaluation(
-  cred: ICredential,
-  presentedBy: string,
-): CredentialEvaluation {
+function credentialToEvaluation(cred: ICredential, presentedBy: string): CredentialEvaluation {
   const ecsType = mapEcsType(cred.schemaType);
-  const result = ecsType !== null ? 'VALID' as const : 'IGNORED' as const;
+  const result = ecsType !== null ? ('VALID' as const) : ('IGNORED' as const);
 
   return {
     result,
@@ -138,10 +143,46 @@ function credentialToEvaluation(
 }
 
 // ---------------------------------------------------------------------------
+// Per-VP outcome partitioning
+// ---------------------------------------------------------------------------
+
+/**
+ * Error codes that describe a VP-level failure (the entire presentation
+ * could not be processed). All other invalid-presentation entries are
+ * credential-level (one or more credentials inside an otherwise-OK VP
+ * failed validation) and are surfaced under `failedCredentials`.
+ */
+const VP_LEVEL_ERROR_CODES: ReadonlySet<string> = new Set<string>([
+  TrustErrorCode.DEREFERENCE_FAILED,
+  TrustErrorCode.VP_SIGNATURE_INVALID,
+  TrustErrorCode.VP_NO_CREDENTIALS,
+  TrustErrorCode.FRAGMENT_NOT_CONFORMANT,
+  // Generic legacy codes used at the VP layer (kept for backward compat
+  // with verre versions that have not yet adopted the fine-grained
+  // VP-level codes above).
+  TrustErrorCode.NOT_SUPPORTED,
+  TrustErrorCode.INVALID_REQUEST,
+]);
+
+/**
+ * Decide whether an `invalidPresentations` entry describes a VP-level
+ * failure (no credentials extracted) or a credential-level failure
+ * (one or more credentials in the VP failed validation). The decision
+ * is driven primarily by `credentialIds.length`, with the explicit
+ * `VP_LEVEL_ERROR_CODES` set as a fallback for entries where the VP
+ * failed before any credentials could be enumerated (e.g. signature
+ * invalid, fetch error).
+ */
+export function isVpLevelFailure(entry: VpOutcomeWithError): boolean {
+  if (entry.credentialIds.length === 0) return true;
+  return VP_LEVEL_ERROR_CODES.has(entry.errorCode);
+}
+
+// ---------------------------------------------------------------------------
 // Build TrustResult from verre TrustResolution
 // ---------------------------------------------------------------------------
 
-function buildTrustResult(
+export function buildTrustResult(
   did: string,
   resolution: TrustResolution,
   currentBlock: number,
@@ -153,23 +194,73 @@ function buildTrustResult(
 
   const credentials: CredentialEvaluation[] = [];
   const failedCredentials: FailedCredential[] = [];
+  const dereferenceErrors: VPDereferenceError[] = [];
 
-  // Map service credential (ECS-SERVICE)
+  // Map verified service credential (ECS-SERVICE).
   if (resolution.service) {
     credentials.push(credentialToEvaluation(resolution.service, did));
   }
 
-  // Map serviceProvider credential (ECS-ORG / ECS-PERSONA)
+  // Map verified serviceProvider credential (ECS-ORG / ECS-PERSONA).
+  // When the SERVICE credential is issued externally (VS-REQ-4) the
+  // serviceProvider was resolved from the issuer's DID Document and is
+  // presented by the issuer DID, not the queried DID.
   if (resolution.serviceProvider) {
-    // serviceProvider may be presented by the DID itself (VS-REQ-3) or by the issuer (VS-REQ-4)
-    const providerPresentedBy = resolution.service && resolution.service.issuer !== did
-      ? resolution.service.issuer
-      : did;
+    const providerPresentedBy =
+      resolution.service && resolution.service.issuer !== did ? resolution.service.issuer : did;
     credentials.push(credentialToEvaluation(resolution.serviceProvider, providerPresentedBy));
   }
 
-  // If not verified, record reason as a failed credential
-  if (!resolution.verified && resolution.metadata) {
+  // Project the per-VP / per-credential `invalidPresentations` array onto
+  // the resolver's two failure buckets:
+  //
+  //   * VP-level failures  → `dereferenceErrors`
+  //   * credential failures → `failedCredentials` (one entry per failing
+  //     credential id, with the verre error code preserved verbatim)
+  //
+  // This is the key behavioural change of the per-VP refactor — a multi-
+  // credential VP whose only flaw is a missing ISSUER permission on one
+  // of its credentials no longer poisons the entire presentation; the
+  // passing credentials show up under `credentials` and the failing
+  // credential shows up under `failedCredentials` with `errorCode`
+  // pinpointing the broken rule.
+  const invalidPresentations = resolution.invalidPresentations ?? [];
+  for (const entry of invalidPresentations) {
+    if (isVpLevelFailure(entry)) {
+      dereferenceErrors.push({
+        vpUrl: entry.vpUrl,
+        error: entry.errorMessage,
+        errorCode: entry.errorCode,
+        serviceId: entry.serviceId,
+        presentationType: entry.presentationType,
+      });
+      continue;
+    }
+    // Credential-level failure: emit one FailedCredential per credentialId.
+    for (const credentialId of entry.credentialIds) {
+      failedCredentials.push({
+        id: credentialId,
+        uri: entry.vpUrl,
+        format: entry.presentationType === 'vtjsc' ? 'W3C_VTJSC' : 'W3C_VTC',
+        error: entry.errorMessage,
+        errorCode: entry.errorCode,
+        serviceId: entry.serviceId,
+        presentationType: entry.presentationType,
+      });
+    }
+  }
+
+  // Fallback: if verre returned a top-level error but did not populate
+  // any per-VP outcome arrays (older verre or non-DID-Document errors
+  // such as DID resolution failure), preserve the legacy single-entry
+  // `failedCredentials` behaviour so callers always see a reason.
+  if (
+    !resolution.verified &&
+    resolution.metadata &&
+    invalidPresentations.length === 0 &&
+    failedCredentials.length === 0 &&
+    dereferenceErrors.length === 0
+  ) {
     failedCredentials.push({
       id: did,
       format: 'N/A',
@@ -187,7 +278,7 @@ function buildTrustResult(
     expiresAt: new Date(now.getTime() + cacheTtlSeconds * 1000).toISOString(),
     credentials,
     failedCredentials,
-    dereferenceErrors: [],
+    dereferenceErrors,
   };
 }
 
@@ -249,6 +340,7 @@ export async function runVerrePass(
           production: trustResult.production,
           validCredentials: trustResult.credentials.filter((c) => c.result === 'VALID').length,
           failedCredentials: trustResult.failedCredentials.length,
+          dereferenceErrors: trustResult.dereferenceErrors.length,
         },
         'Verre pass: DID processed and trust stored',
       );

@@ -1,7 +1,12 @@
 export type TrustStatus = 'TRUSTED' | 'PARTIAL' | 'UNTRUSTED';
 export type CredentialResultStatus = 'VALID' | 'IGNORED' | 'FAILED';
 export type EcsType = 'ECS-SERVICE' | 'ECS-ORG' | 'ECS-PERSONA' | 'ECS-UA' | null;
-export type PermissionType = 'ISSUER' | 'ISSUER_GRANTOR' | 'ECOSYSTEM' | 'VERIFIER' | 'VERIFIER_GRANTOR';
+export type PermissionType =
+  | 'ISSUER'
+  | 'ISSUER_GRANTOR'
+  | 'ECOSYSTEM'
+  | 'VERIFIER'
+  | 'VERIFIER_GRANTOR';
 
 export interface PermissionChainEntry {
   permissionId: number;
@@ -53,11 +58,25 @@ export interface FailedCredential {
   format: string;
   error: string;
   errorCode: string;
+  /** DID Document service id (with fragment) the credential came from, when available. */
+  serviceId?: string;
+  /**
+   * Presentation flow that produced the credential — `'vtc'` for the
+   * standard W3C VTC flow or `'vtjsc'` for credentials presented
+   * directly via a `-vtjsc-vp` / `-jsc-vp` linked-vp service.
+   */
+  presentationType?: 'vtc' | 'vtjsc';
 }
 
 export interface VPDereferenceError {
   vpUrl: string;
   error: string;
+  /** Error code (verre `TrustErrorCode`); enables programmatic disambiguation. */
+  errorCode?: string;
+  /** DID Document service id (with fragment) where this VP failed. */
+  serviceId?: string;
+  /** Presentation flow declared by the service fragment. */
+  presentationType?: 'vtc' | 'vtjsc';
 }
 
 export interface TrustResult {
