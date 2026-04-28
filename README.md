@@ -1,4 +1,6 @@
-# Verana Trust Resolver
+# Verana Trust Resolver — `mjfelis/verana-resolver` fork
+
+> **Fork notice.** This `feat/fork-publish` branch builds a custom container image from this fork while the `feat/per-vp-outcomes` per-VP / spec-v4 changes are pending upstream review. The image is published as `ghcr.io/mjfelis/verana-resolver:feat-fork-publish` (plus per-SHA tags) by the `Fork — build & push Docker image to ghcr.io` workflow. The fork's `@verana-labs/verre` dependency is pinned to the matching [`mjfelis/verre#feat/fork-publish`](https://github.com/mjfelis/verre/tree/feat/fork-publish) branch via a git URL, so no source-level renames are needed and the upstream-PR-bound branches stay clean.
 
 The **Verana Trust Resolver** is a core infrastructure component of the [Verana](https://verana.io) ecosystem. It continuously ingests state from the **Verana Indexer**, resolves decentralized identifiers (DIDs), dereferences verifiable credentials (VCs) presented as [linked-vp](https://identity.foundation/linked-vp/) in DID Documents, and validates trust according to the **Verifiable Trust Specification**.
 
