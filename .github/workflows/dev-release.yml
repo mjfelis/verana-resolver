@@ -6,6 +6,11 @@ on:
 
 jobs:
   dev-release:
+    # Gate the inherited Docker-Hub / semantic-release pipeline to the
+    # canonical upstream repo. Forks publish via fork-docker.yml to
+    # ghcr.io and have no DOCKER_HUB_* secrets, so this job would fail
+    # on every push to main on a fork. Skipping it avoids the noise.
+    if: github.repository == 'verana-labs/verana-resolver'
     runs-on: ubuntu-latest
     permissions:
       contents: write
