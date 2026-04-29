@@ -344,6 +344,281 @@ describe('buildTrustResult — credential-level failures (failedCredentials)', (
   });
 });
 
+// ---------------------------------------------------------------------------
+// Per-VP outcome arrays surfaced in the response (verana-indexer#227).
+//
+// These tests assert the *new* public contract: every linked-vp service
+// entry on the queried DID Document MUST be reflected in either
+// `validPresentations[]`, `invalidPresentations[]`, or both (partially
+// valid). They are independent of the legacy `dereferenceErrors[]` /
+// `failedCredentials[]` projections — a single resolution must populate
+// both shapes in lockstep so existing consumers and new consumers can
+// each see a complete, internally consistent picture.
+// ---------------------------------------------------------------------------
+
+describe('buildTrustResult — validPresentations[] / invalidPresentations[] (verana-indexer#227)', () => {
+  it('surfaces every successful linked-vp as a ValidPresentation with id = vpUrl', () => {
+    const result = buildTrustResult(
+      DID,
+      baseResolution({
+        service: {
+          schemaType: ECS.SERVICE,
+          id: 'urn:uuid:svc',
+          issuer: DID,
+          name: 'Svc',
+          type: 'Svc',
+          description: 'A',
+          minimumAgeRequired: 0,
+          termsAndConditions: 'https://example.com/terms',
+          privacyPolicy: 'https://example.com/privacy',
+        } as any,
+        validPresentations: [
+          {
+            serviceId: `${DID}#vpr-schemas-service-vtc-vp`,
+            vpUrl: 'https://avatar.eafit.testnet.verana.network/vt/schemas-service-vtc-vp.json',
+            presentationType: PresentationType.VTC,
+            credentialIds: ['urn:uuid:svc'],
+          },
+          {
+            serviceId: `${DID}#vpr-schemas-org-vtc-vp`,
+            vpUrl: 'https://organization.eafit.testnet.verana.network/vt/schemas-org-vtc-vp.json',
+            presentationType: PresentationType.VTC,
+            credentialIds: ['urn:uuid:org'],
+          },
+        ],
+      }),
+      CURRENT_BLOCK,
+      TTL,
+    );
+
+    expect(result.validPresentations).toEqual([
+      {
+        id: 'https://avatar.eafit.testnet.verana.network/vt/schemas-service-vtc-vp.json',
+        credentialIds: ['urn:uuid:svc'],
+        serviceId: `${DID}#vpr-schemas-service-vtc-vp`,
+        presentationType: PresentationType.VTC,
+      },
+      {
+        id: 'https://organization.eafit.testnet.verana.network/vt/schemas-org-vtc-vp.json',
+        credentialIds: ['urn:uuid:org'],
+        serviceId: `${DID}#vpr-schemas-org-vtc-vp`,
+        presentationType: PresentationType.VTC,
+      },
+    ]);
+    expect(result.invalidPresentations).toEqual([]);
+  });
+
+  it('surfaces VP-level failures on invalidPresentations[] AND dereferenceErrors[] simultaneously', () => {
+    const result = buildTrustResult(
+      DID,
+      baseResolution({
+        verified: false,
+        outcome: TrustResolutionOutcome.INVALID,
+        invalidPresentations: [
+          {
+            serviceId: `${DID}#vpr-schemas-service-vtc-vp`,
+            vpUrl: 'https://example.com/vp-bad-sig',
+            presentationType: PresentationType.VTC,
+            credentialIds: [],
+            errorCode: TrustErrorCode.VP_SIGNATURE_INVALID,
+            errorMessage: 'signature did not verify',
+          },
+        ],
+      }),
+      CURRENT_BLOCK,
+      TTL,
+    );
+
+    // New contract: VP-level failure on the public array.
+    expect(result.invalidPresentations).toEqual([
+      {
+        id: 'https://example.com/vp-bad-sig',
+        errorCode: TrustErrorCode.VP_SIGNATURE_INVALID,
+        errorMessage: 'signature did not verify',
+        credentialIds: [],
+        serviceId: `${DID}#vpr-schemas-service-vtc-vp`,
+        presentationType: PresentationType.VTC,
+      },
+    ]);
+    // Legacy contract: same data still on dereferenceErrors[] for back-compat.
+    expect(result.dereferenceErrors).toHaveLength(1);
+    expect(result.dereferenceErrors[0].errorCode).toBe(TrustErrorCode.VP_SIGNATURE_INVALID);
+    // Credential-level legacy bucket stays empty.
+    expect(result.failedCredentials).toEqual([]);
+  });
+
+  it('surfaces credential-level failures on invalidPresentations[] AND failedCredentials[]', () => {
+    const result = buildTrustResult(
+      DID,
+      baseResolution({
+        verified: false,
+        outcome: TrustResolutionOutcome.INVALID,
+        invalidPresentations: [
+          {
+            serviceId: `${DID}#vpr-schemas-org-vtc-vp`,
+            vpUrl: 'https://example.com/vp-bad-issuer',
+            presentationType: PresentationType.VTC,
+            credentialIds: ['urn:uuid:cred-1'],
+            errorCode: TrustErrorCode.ISSUER_PERMISSION_MISSING,
+            errorMessage: 'issuer not permissioned',
+          },
+        ],
+      }),
+      CURRENT_BLOCK,
+      TTL,
+    );
+
+    // New contract: ONE entry per (VP, errorCode) pair on the public array,
+    // carrying the failing credential id.
+    expect(result.invalidPresentations).toHaveLength(1);
+    expect(result.invalidPresentations[0]).toEqual({
+      id: 'https://example.com/vp-bad-issuer',
+      errorCode: TrustErrorCode.ISSUER_PERMISSION_MISSING,
+      errorMessage: 'issuer not permissioned',
+      credentialIds: ['urn:uuid:cred-1'],
+      serviceId: `${DID}#vpr-schemas-org-vtc-vp`,
+      presentationType: PresentationType.VTC,
+    });
+    // Legacy contract: one failedCredentials entry per credentialId; VP-level
+    // bucket stays empty since the VP itself was processable.
+    expect(result.failedCredentials).toHaveLength(1);
+    expect(result.failedCredentials[0].id).toBe('urn:uuid:cred-1');
+    expect(result.dereferenceErrors).toEqual([]);
+  });
+
+  it('reports a partially-valid VP in BOTH arrays with disjoint credential IDs (verana-indexer#227 example)', () => {
+    // The canonical test case from the issue: a single multi-credential
+    // VP whose SERVICE credential passes and whose ORG credential fails
+    // with `ISSUER_PERMISSION_MISSING` MUST appear once in
+    // `validPresentations` (with the OK credential) and once in
+    // `invalidPresentations` (with the failing credential), the two
+    // entries sharing the same `id`.
+    const VP_URL = 'https://example.com/vp-multi';
+    const SERVICE_ID = `${DID}#vpr-schemas-multi-vtc-vp`;
+    const result = buildTrustResult(
+      DID,
+      baseResolution({
+        service: {
+          schemaType: ECS.SERVICE,
+          id: 'urn:uuid:svc-OK',
+          issuer: DID,
+          name: 'Svc',
+          type: 'Svc',
+          description: 'A',
+          minimumAgeRequired: 0,
+          termsAndConditions: 'https://example.com/terms',
+          privacyPolicy: 'https://example.com/privacy',
+        } as any,
+        validPresentations: [
+          {
+            serviceId: SERVICE_ID,
+            vpUrl: VP_URL,
+            presentationType: PresentationType.VTC,
+            credentialIds: ['urn:uuid:svc-OK'],
+          },
+        ],
+        invalidPresentations: [
+          {
+            serviceId: SERVICE_ID,
+            vpUrl: VP_URL,
+            presentationType: PresentationType.VTC,
+            credentialIds: ['urn:uuid:org-FAIL'],
+            errorCode: TrustErrorCode.ISSUER_PERMISSION_MISSING,
+            errorMessage: 'no ISSUER',
+          },
+        ],
+      }),
+      CURRENT_BLOCK,
+      TTL,
+    );
+
+    expect(result.validPresentations).toHaveLength(1);
+    expect(result.invalidPresentations).toHaveLength(1);
+    // Same VP id in both arrays — this is the explicit co-existence rule.
+    expect(result.validPresentations[0].id).toBe(VP_URL);
+    expect(result.invalidPresentations[0].id).toBe(VP_URL);
+    // Disjoint credential IDs.
+    expect(result.validPresentations[0].credentialIds).toEqual(['urn:uuid:svc-OK']);
+    expect(result.invalidPresentations[0].credentialIds).toEqual(['urn:uuid:org-FAIL']);
+  });
+
+  it('emits a separate invalidPresentations entry per (VP, errorCode) pair when one VP has multiple distinct failures', () => {
+    // Per verana-indexer#227 example, a multi-credential VP whose
+    // credentials fail with different error codes is split into one
+    // entry per error code (not one per credential) so consumers can
+    // group by failure mode.
+    const VP_URL = 'https://example.com/vp-multi-error';
+    const result = buildTrustResult(
+      DID,
+      baseResolution({
+        verified: false,
+        outcome: TrustResolutionOutcome.INVALID,
+        invalidPresentations: [
+          {
+            serviceId: `${DID}#vpr-schemas-multi-vtc-vp`,
+            vpUrl: VP_URL,
+            presentationType: PresentationType.VTC,
+            credentialIds: ['urn:uuid:cred-revoked'],
+            errorCode: 'CREDENTIAL_REVOKED' as TrustErrorCode,
+            errorMessage: 'revoked',
+          },
+          {
+            serviceId: `${DID}#vpr-schemas-multi-vtc-vp`,
+            vpUrl: VP_URL,
+            presentationType: PresentationType.VTC,
+            credentialIds: ['urn:uuid:cred-bad-issuer'],
+            errorCode: TrustErrorCode.ISSUER_PERMISSION_MISSING,
+            errorMessage: 'no ISSUER',
+          },
+        ],
+      }),
+      CURRENT_BLOCK,
+      TTL,
+    );
+
+    expect(result.invalidPresentations).toHaveLength(2);
+    expect(result.invalidPresentations.map((p) => p.errorCode).sort()).toEqual(
+      ['CREDENTIAL_REVOKED', TrustErrorCode.ISSUER_PERMISSION_MISSING].sort(),
+    );
+  });
+
+  it('preserves the v3 legacy fragment as-is — verre is the source of truth for fragment classification', () => {
+    // The resolver MUST NOT re-parse the fragment; it MUST surface
+    // whatever verre classified, including legacy `-c-vp` / `-jsc-vp`
+    // suffixes (verana-indexer#227 acceptance criterion: "Spec v4 and
+    // spec v3 fragment forms are both accepted and treated equivalently").
+    const result = buildTrustResult(
+      DID,
+      baseResolution({
+        service: {
+          schemaType: ECS.SERVICE,
+          id: 'urn:uuid:svc',
+          issuer: DID,
+          name: 'Svc',
+          type: 'Svc',
+          description: 'A',
+          minimumAgeRequired: 0,
+          termsAndConditions: 'https://example.com/terms',
+          privacyPolicy: 'https://example.com/privacy',
+        } as any,
+        validPresentations: [
+          {
+            serviceId: `${DID}#vpr-schemas-service-c-vp`, // legacy v3 suffix
+            vpUrl: 'https://example.com/vp-legacy',
+            presentationType: PresentationType.VTC,
+            credentialIds: ['urn:uuid:svc'],
+          },
+        ],
+      }),
+      CURRENT_BLOCK,
+      TTL,
+    );
+
+    expect(result.validPresentations[0].serviceId).toBe(`${DID}#vpr-schemas-service-c-vp`);
+    expect(result.validPresentations[0].presentationType).toBe(PresentationType.VTC);
+  });
+});
+
 describe('buildTrustResult — backward compatibility', () => {
   it('falls back to the legacy single-failedCredential entry when verre returns no per-VP arrays', () => {
     // Simulate a verre version that does not yet populate validPresentations/
