@@ -11,7 +11,11 @@ import { registry, queryDurationSeconds } from './observability/metrics.js';
 import { getPool, closePool } from './db/index.js';
 import { runMigrations } from './db/migrate.js';
 import { connectRedis, disconnectRedis } from './cache/redis-client.js';
-import { startPollingLoop, parseVprRegistries } from './polling/polling-loop.js';
+import {
+  startPollingLoop,
+  parseVprRegistries,
+  logStartupConfigCrossChecks,
+} from './polling/polling-loop.js';
 import { createInjectDidRoute } from './routes/inject-did.js';
 import { createQ5oute } from './routes/refresh.js';
 import { registerSwagger } from './swagger.js';
@@ -22,6 +26,13 @@ const logger = createLogger('main');
 
 async function main(): Promise<void> {
   const config = loadConfig();
+
+  // 0. Validate VPR_REGISTRIES JSON shape and surface common cross-config
+  // misconfigurations as warnings before any DID resolution is attempted.
+  // `parseVprRegistries` throws on a malformed JSON / shape error, so the
+  // resolver fails fast at boot rather than at request-handling time.
+  const verifiablePublicRegistries = parseVprRegistries(config.VPR_REGISTRIES);
+  logStartupConfigCrossChecks(config, verifiablePublicRegistries);
 
   // 1. Connect to PostgreSQL and run pending migrations
   logger.info('Connecting to PostgreSQL and running migrations...');
@@ -71,8 +82,8 @@ async function main(): Promise<void> {
 
   // Q2+ endpoints need IndexerClient
   const indexer = new IndexerClient(config.INDEXER_API);
-  await createQ2Route(parseVprRegistries(config.VPR_REGISTRIES))(server);
-  await createQ3Route(parseVprRegistries(config.VPR_REGISTRIES))(server);
+  await createQ2Route(verifiablePublicRegistries)(server);
+  await createQ3Route(verifiablePublicRegistries)(server);
   await createQ4Route(indexer)(server);
   await createQ5oute(indexer, config)(server);
 

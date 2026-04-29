@@ -1,4 +1,5 @@
 import type { VerifiablePublicRegistry } from '@verana-labs/verre';
+import { z } from 'zod';
 import { IndexerClient } from '../indexer/client.js';
 import { loadConfig, type EnvConfig } from '../config/index.js';
 import { tryAcquireLeaderLock, releaseLeaderLock } from './leader.js';
@@ -56,14 +57,141 @@ export async function startPollingLoop(opts: PollingLoopOptions): Promise<void> 
   }
 }
 
+/**
+ * Strict shape of a single `VPR_REGISTRIES` entry, validated at startup so
+ * misconfiguration (a wrong `id`, a non-URL `baseUrls[0]`, …) fails fast with
+ * a clear message instead of surfacing later as a confusing per-DID error.
+ *
+ * Mirrors the public `VerifiablePublicRegistry` type from `@verana-labs/verre`
+ * with the contract enforced explicitly:
+ *   - `id` MUST start with `vpr:` because verre's `resolveTrustRegistry`
+ *     only rewrites refUrls beginning with that scheme.
+ *   - `baseUrls` MUST be a non-empty array of valid http(s) URLs since
+ *     verre uses `baseUrls[0]` as the HTTPS rewrite target.
+ *   - `production` MUST be a boolean — verre maps it to
+ *     `TrustResolutionOutcome.VERIFIED` vs `VERIFIED_TEST`.
+ */
+const vprEntrySchema = z.object({
+  id: z.string().refine((s) => s.startsWith('vpr:'), {
+    message: "VPR_REGISTRIES entries must have an id starting with 'vpr:' (e.g. 'vpr:verana:vna-testnet-1')",
+  }),
+  baseUrls: z.array(z.string().url()).min(1, 'VPR_REGISTRIES.baseUrls must contain at least one URL'),
+  production: z.boolean(),
+  // Optional registry-scoped policy carried through to verre.
+  allowedEcsEcosystems: z.array(z.string()).optional(),
+});
+
+const vprRegistriesSchema = z.array(vprEntrySchema);
+
+/**
+ * Parse and validate the `VPR_REGISTRIES` env JSON.
+ *
+ * Behaviour:
+ *   - Empty/absent input → `[]` (compatible with tests that explicitly set
+ *     `VPR_REGISTRIES='[]'` and with the resolver running with no allowlist).
+ *   - Valid array of entries → typed array.
+ *   - Malformed JSON or a shape violation → throws an `Error` with all Zod
+ *     issues joined into the message. Previously this case silently returned
+ *     `[]`, which masked operator misconfiguration as later per-DID
+ *     `not_found` / `null/...` errors several layers downstream.
+ */
 export function parseVprRegistries(json: string): VerifiablePublicRegistry[] {
+  if (!json || json.trim() === '') return [];
+
+  let parsed: unknown;
   try {
-    const parsed = JSON.parse(json) as VerifiablePublicRegistry[];
-    if (!Array.isArray(parsed)) return [];
-    return parsed;
-  } catch {
-    logger.warn({ json }, 'Failed to parse VPR_REGISTRIES JSON — using empty list');
-    return [];
+    parsed = JSON.parse(json);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    throw new Error(`VPR_REGISTRIES is not valid JSON: ${message}`);
+  }
+
+  const result = vprRegistriesSchema.safeParse(parsed);
+  if (!result.success) {
+    const errors = result.error.issues
+      .map((issue) => `  ${issue.path.length > 0 ? issue.path.join('.') : '(root)'}: ${issue.message}`)
+      .join('\n');
+    throw new Error(`Invalid VPR_REGISTRIES configuration:\n${errors}`);
+  }
+
+  // The Zod-inferred type is structurally compatible with the public
+  // `VerifiablePublicRegistry`, but TS does not know they are the same type
+  // because the latter lives in another package. The cast is sound because
+  // the schema enforces every required field.
+  return result.data as VerifiablePublicRegistry[];
+}
+
+/**
+ * Cross-reference startup configuration to surface common misconfigurations
+ * as actionable warnings before any DID resolution is attempted.
+ *
+ * Two checks are performed, both non-fatal:
+ *
+ *   1. `INDEXER_API` host should appear in at least one
+ *      `VPR_REGISTRIES[].baseUrls[0]` host. The most common operator
+ *      footgun is pointing the resolver at the testnet indexer while
+ *      configuring only the devnet registry (or vice versa). The
+ *      symptom — "every DID resolution fails" — is far from the cause,
+ *      so we surface it explicitly here.
+ *   2. Each entry of `ECS_ECOSYSTEM_DIDS` (CSV) should be a well-formed
+ *      DID string. A typo here means the resolver tracks an ecosystem
+ *      that never produces results, with no obvious failure signal.
+ *
+ * Both checks log via the polling-loop logger; neither throws so the
+ * resolver still boots even if the operator wants to override the
+ * defaults intentionally.
+ */
+export function logStartupConfigCrossChecks(
+  config: Pick<EnvConfig, 'INDEXER_API' | 'ECS_ECOSYSTEM_DIDS' | 'VPR_REGISTRIES'>,
+  registries: VerifiablePublicRegistry[],
+): void {
+  // 1. INDEXER_API host vs registries baseUrls hosts.
+  if (registries.length > 0) {
+    let indexerHost: string | null = null;
+    try {
+      indexerHost = new URL(config.INDEXER_API).host;
+    } catch {
+      // INDEXER_API is already validated as a URL by the env Zod schema, so
+      // this branch is defensive only — left in to avoid throwing here.
+      indexerHost = null;
+    }
+
+    if (indexerHost) {
+      const registryHosts = registries
+        .map((r) => {
+          try {
+            return new URL(r.baseUrls[0]).host;
+          } catch {
+            return null;
+          }
+        })
+        .filter((h): h is string => h !== null);
+
+      const matched = registryHosts.some((h) => h === indexerHost);
+      if (!matched) {
+        logger.warn(
+          {
+            indexerHost,
+            registryHosts,
+            registryIds: registries.map((r) => r.id),
+          },
+          'INDEXER_API host does not match any VPR_REGISTRIES baseUrls host — common testnet/devnet mismatch. DID resolutions referencing the indexer\'s registry id will fail with REGISTRY_NOT_CONFIGURED.',
+        );
+      }
+    }
+  }
+
+  // 2. ECS_ECOSYSTEM_DIDS shape.
+  const ecosystems = config.ECS_ECOSYSTEM_DIDS.split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+
+  const malformed = ecosystems.filter((d) => !d.startsWith('did:'));
+  if (malformed.length > 0) {
+    logger.warn(
+      { malformed },
+      'ECS_ECOSYSTEM_DIDS contains entries that are not well-formed DIDs (must start with \'did:\'). These ecosystems will not be tracked.',
+    );
   }
 }
 
