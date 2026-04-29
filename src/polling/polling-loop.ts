@@ -206,6 +206,14 @@ export async function pollOnce(
   const verifiablePublicRegistries = parseVprRegistries(config.VPR_REGISTRIES);
   const skipDigestSRICheck = config.DISABLE_DIGEST_SRI_VERIFICATION;
 
+  // Per-pass resilience + observability knobs. Centralised here so every
+  // `runVerrePass` call below picks them up consistently and operators can
+  // tune them via env vars without touching code.
+  const verrePassOptions = {
+    perDidTimeoutMs: config.VERRE_PER_DID_TIMEOUT_MS,
+    progressLogEvery: config.VERRE_PASS_PROGRESS_LOG_EVERY,
+  };
+
   // Clear Indexer memo per cycle
   indexer.clearMemo();
 
@@ -221,7 +229,15 @@ export async function pollOnce(
     logger.info({ count: affectedDids.size, indexerHeight }, 'Initial sync: running verre pass');
 
     if (affectedDids.size > 0) {
-      await runVerrePass(affectedDids, indexer, indexerHeight, config.TRUST_TTL, verifiablePublicRegistries, skipDigestSRICheck);
+      await runVerrePass(
+        affectedDids,
+        indexer,
+        indexerHeight,
+        config.TRUST_TTL,
+        verifiablePublicRegistries,
+        skipDigestSRICheck,
+        verrePassOptions,
+      );
       didsAffected += affectedDids.size;
     }
 
@@ -274,7 +290,15 @@ export async function pollOnce(
       if (affectedDids.size > 0) {
 
         // Unified verre pass: DID resolution + VP dereferencing + trust evaluation
-        await runVerrePass(affectedDids, indexer, target, config.TRUST_TTL, verifiablePublicRegistries, skipDigestSRICheck);
+        await runVerrePass(
+          affectedDids,
+          indexer,
+          target,
+          config.TRUST_TTL,
+          verifiablePublicRegistries,
+          skipDigestSRICheck,
+          verrePassOptions,
+        );
 
         didsAffected += affectedDids.size;
       }
@@ -344,7 +368,18 @@ async function retryEligibleDids(
   );
   if (dids.size === 0) return;
 
-  const result = await runVerrePass(dids, indexer, currentBlock, config.TRUST_TTL, verifiablePublicRegistries, skipDigestSRICheck);
+  const result = await runVerrePass(
+    dids,
+    indexer,
+    currentBlock,
+    config.TRUST_TTL,
+    verifiablePublicRegistries,
+    skipDigestSRICheck,
+    {
+      perDidTimeoutMs: config.VERRE_PER_DID_TIMEOUT_MS,
+      progressLogEvery: config.VERRE_PASS_PROGRESS_LOG_EVERY,
+    },
+  );
 
   // Remove successfully retried resources
   for (const did of result.succeeded) {
@@ -376,5 +411,16 @@ async function refreshExpiredEvaluations(
     'Refreshing trust evaluations approaching expiration',
   );
 
-  await runVerrePass(refreshDids, indexer, currentBlock, config.TRUST_TTL, verifiablePublicRegistries, skipDigestSRICheck);
+  await runVerrePass(
+    refreshDids,
+    indexer,
+    currentBlock,
+    config.TRUST_TTL,
+    verifiablePublicRegistries,
+    skipDigestSRICheck,
+    {
+      perDidTimeoutMs: config.VERRE_PER_DID_TIMEOUT_MS,
+      progressLogEvery: config.VERRE_PASS_PROGRESS_LOG_EVERY,
+    },
+  );
 }

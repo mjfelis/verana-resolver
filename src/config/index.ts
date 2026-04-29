@@ -53,6 +53,18 @@ const envSchema = z.object({
   PORT: z.coerce.number().int().positive().default(3000),
   LOG_LEVEL: LogLevel.default('info'),
 
+  // Per-DID deadline applied inside `runVerrePass`. The default is
+  // intentionally larger than verre's 15s HTTP fetch timeout so a DID
+  // that chains a few sequential fetches (DID log + multiple VPs +
+  // VCs + permission checks) can still complete before the resolver
+  // gives up. Set to 0 to disable the per-DID deadline entirely.
+  VERRE_PER_DID_TIMEOUT_MS: z.coerce.number().int().min(0).default(60_000),
+
+  // Emit a `Verre pass progress` info log every N completed DIDs.
+  // Set to 0 to suppress progress logs entirely. The pass-start and
+  // pass-complete logs are emitted regardless.
+  VERRE_PASS_PROGRESS_LOG_EVERY: z.coerce.number().int().min(0).default(10),
+
 });
 
 export type EnvConfig = z.infer<typeof envSchema>;

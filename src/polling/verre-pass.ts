@@ -286,6 +286,82 @@ export function buildTrustResult(
 // Unified pass: replaces runPass1 + runPass2
 // ---------------------------------------------------------------------------
 
+/**
+ * Optional knobs for `runVerrePass` that control resilience and
+ * observability without changing the (already-busy) positional
+ * parameter list.
+ */
+export interface RunVerrePassOptions {
+  /**
+   * Maximum time (ms) any single `verreResolveDID` call may take
+   * before the pass abandons that DID and continues with the next.
+   *
+   * The default value is intentionally larger than verre's own HTTP
+   * fetch timeout so a DID that chains several legitimate sequential
+   * fetches (DID log + multiple VPs + VCs + permission checks) can
+   * still complete. Even with verre's 15s per-fetch ceiling, a DID
+   * with N fetches can take up to ~15·N seconds, so the resolver-side
+   * deadline acts as a final guard.
+   *
+   * Set to `0` to disable the deadline (rely solely on verre's
+   * fetch timeout). Defaults to `60000` when omitted.
+   */
+  perDidTimeoutMs?: number;
+
+  /**
+   * Emit a `Verre pass progress` `info` log every N completed DIDs.
+   * Without this, an `info`-level operator sees `Verre pass started`
+   * and then nothing until the entire pass finishes, with no way to
+   * tell which DID is in flight.
+   *
+   * Set to `0` to suppress progress logs (start/complete logs still
+   * fire). Defaults to `10` when omitted.
+   */
+  progressLogEvery?: number;
+}
+
+/**
+ * Sentinel error thrown by `withDeadline` when the per-DID deadline
+ * fires. Caught and translated into a structured `failed` entry by
+ * the main loop so timeouts do not bubble as generic errors.
+ */
+class PerDidDeadlineExceededError extends Error {
+  constructor(
+    readonly did: string,
+    readonly deadlineMs: number,
+  ) {
+    super(`Per-DID deadline of ${deadlineMs}ms exceeded for ${did}`);
+    this.name = 'PerDidDeadlineExceededError';
+  }
+}
+
+/**
+ * Race a verre call against a per-DID timer. When `deadlineMs` is `0`
+ * the timer is skipped and the original promise is returned as-is so
+ * the caller can opt into "no resolver-side deadline".
+ *
+ * Implementation detail: `setTimeout(..., 0)` would fire immediately,
+ * so the disabled path is gated explicitly rather than encoded as
+ * "0ms timer". The timer is also cleared if the original promise
+ * settles first, to avoid leaking a long-running unref-by-default
+ * Node.js timer into the event loop.
+ */
+function withDeadline<T>(promise: Promise<T>, deadlineMs: number, did: string): Promise<T> {
+  if (deadlineMs <= 0) return promise;
+
+  let timer: NodeJS.Timeout | undefined;
+  const timeoutPromise = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new PerDidDeadlineExceededError(did, deadlineMs)), deadlineMs);
+  });
+
+  return Promise.race([
+    promise.finally(() => {
+      if (timer) clearTimeout(timer);
+    }),
+    timeoutPromise,
+  ]);
+}
+
 export async function runVerrePass(
   affectedDids: Set<string>,
   _indexer: IndexerClient,
@@ -293,28 +369,53 @@ export async function runVerrePass(
   trustTtlSeconds: number,
   verifiablePublicRegistries: VerifiablePublicRegistry[],
   skipDigestSRICheck: boolean,
-): Promise<{ succeeded: string[]; failed: string[] }> {
+  options: RunVerrePassOptions = {},
+): Promise<{ succeeded: string[]; failed: string[]; timedOut: string[] }> {
+  const perDidTimeoutMs = options.perDidTimeoutMs ?? 60_000;
+  const progressLogEvery = options.progressLogEvery ?? 10;
+
   const succeeded: string[] = [];
   const failed: string[] = [];
+  // `timedOut` is a strict subset of `failed`; surfaced separately so
+  // operators can tell timeout-driven failures from logic-driven ones.
+  const timedOut: string[] = [];
+
+  const passStart = Date.now();
+  let processed = 0;
 
   logger.info(
-    { didCount: affectedDids.size, block: currentBlock },
+    {
+      didCount: affectedDids.size,
+      block: currentBlock,
+      perDidTimeoutMs,
+      progressLogEvery,
+    },
     'Verre pass started — DID resolution + trust evaluation',
   );
 
   for (const did of affectedDids) {
+    const didStart = Date.now();
+
     try {
       // 1. Invalidate cached DID Document (same as old Pass1)
       logger.debug({ did }, 'Invalidating cached DID document');
       await deleteCachedFile(did);
 
-      // 2. Single verre call: DID resolution + VP dereferencing + trust evaluation
-      logger.debug({ did }, 'Calling verre resolveDID');
-      const resolution = await verreResolveDID(did, {
-        verifiablePublicRegistries,
-        skipDigestSRICheck,
-        logger: verreLogger,
-      });
+      // 2. Single verre call, gated by the per-DID deadline. Even with
+      // verre's own per-fetch HTTP timeout, an adversarial DID could
+      // chain enough fetches to multiply the wall-clock cost; the
+      // deadline below is the last line of defence against a slow DID
+      // starving the rest of the pass.
+      logger.debug({ did, perDidTimeoutMs }, 'Calling verre resolveDID');
+      const resolution = await withDeadline(
+        verreResolveDID(did, {
+          verifiablePublicRegistries,
+          skipDigestSRICheck,
+          logger: verreLogger,
+        }),
+        perDidTimeoutMs,
+        did,
+      );
 
       logger.debug(
         {
@@ -325,6 +426,7 @@ export async function runVerrePass(
           hasServiceProvider: !!resolution.serviceProvider,
           errorCode: resolution.metadata?.errorCode,
           errorMessage: resolution.metadata?.errorMessage,
+          elapsedMs: Date.now() - didStart,
         },
         'Verre resolveDID complete',
       );
@@ -341,24 +443,62 @@ export async function runVerrePass(
           validCredentials: trustResult.credentials.filter((c) => c.result === 'VALID').length,
           failedCredentials: trustResult.failedCredentials.length,
           dereferenceErrors: trustResult.dereferenceErrors.length,
+          elapsedMs: Date.now() - didStart,
         },
         'Verre pass: DID processed and trust stored',
       );
 
       succeeded.push(did);
     } catch (err) {
-      logger.error({ did, err }, 'Verre pass: unexpected error');
+      const elapsedMs = Date.now() - didStart;
 
-      // On failure, mark as reattemptable and UNTRUSTED
+      if (err instanceof PerDidDeadlineExceededError) {
+        // Distinct log path so dashboards / log-based alerting can pick
+        // up "stuck DID" cases without false-positives from logic
+        // failures (bad VP signature, missing permission, …).
+        logger.warn(
+          { did, deadlineMs: err.deadlineMs, elapsedMs },
+          'Verre pass: per-DID deadline exceeded — skipping DID, will retry next pass',
+        );
+        timedOut.push(did);
+      } else {
+        logger.error({ did, err, elapsedMs }, 'Verre pass: unexpected error');
+      }
+
+      // On any failure (timeout or otherwise), mark as reattemptable
+      // and UNTRUSTED so the next pass picks the DID back up. This
+      // preserves the previous semantics while letting the loop
+      // continue past a single bad DID.
       await addReattemptable(did, 'TRUST_EVAL', 'TRANSIENT');
       await markUntrusted(did, currentBlock, trustTtlSeconds);
       failed.push(did);
     }
+
+    processed++;
+    if (progressLogEvery > 0 && processed % progressLogEvery === 0) {
+      logger.info(
+        {
+          processed,
+          total: affectedDids.size,
+          succeeded: succeeded.length,
+          failed: failed.length,
+          timedOut: timedOut.length,
+          elapsedMs: Date.now() - passStart,
+        },
+        'Verre pass progress',
+      );
+    }
   }
 
   logger.info(
-    { succeeded: succeeded.length, failed: failed.length, block: currentBlock },
+    {
+      succeeded: succeeded.length,
+      failed: failed.length,
+      timedOut: timedOut.length,
+      block: currentBlock,
+      elapsedMs: Date.now() - passStart,
+    },
     'Verre pass complete',
   );
-  return { succeeded, failed };
+  return { succeeded, failed, timedOut };
 }
