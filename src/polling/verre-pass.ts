@@ -10,6 +10,7 @@ import {
   type IOrg,
   type IPersona,
   type IUserAgent,
+  type VpOutcome,
   type VpOutcomeWithError,
 } from '@verana-labs/verre';
 import type { IndexerClient } from '../indexer/client.js';
@@ -22,6 +23,8 @@ import type {
   CredentialEvaluation,
   FailedCredential,
   VPDereferenceError,
+  ValidPresentation,
+  InvalidPresentation,
   EcsType,
 } from '../trust/types.js';
 import { verreLogger } from '../trust/verre-logger.js';
@@ -196,6 +199,24 @@ export function buildTrustResult(
   const failedCredentials: FailedCredential[] = [];
   const dereferenceErrors: VPDereferenceError[] = [];
 
+  // Per-VP outcome arrays surfaced verbatim in the response, aligned with
+  // verana-indexer#227. Each linked-vp service entry on the queried DID
+  // Document contributes at most one `ValidPresentation` (when at least
+  // one credential inside passed validation) and zero or more
+  // `InvalidPresentation` entries (one per (VP, errorCode) pair). A
+  // partially-valid VP intentionally appears in both arrays so consumers
+  // can see precisely which credentials inside it passed and which did
+  // not without losing per-credential granularity.
+  const validPresentationsOut: ValidPresentation[] = (resolution.validPresentations ?? []).map(
+    (vp: VpOutcome) => ({
+      id: vp.vpUrl,
+      credentialIds: [...vp.credentialIds],
+      serviceId: vp.serviceId,
+      presentationType: vp.presentationType,
+    }),
+  );
+  const invalidPresentationsOut: InvalidPresentation[] = [];
+
   // Map verified service credential (ECS-SERVICE).
   if (resolution.service) {
     credentials.push(credentialToEvaluation(resolution.service, did));
@@ -226,6 +247,19 @@ export function buildTrustResult(
   // pinpointing the broken rule.
   const invalidPresentations = resolution.invalidPresentations ?? [];
   for (const entry of invalidPresentations) {
+    // Always surface the entry verbatim on `invalidPresentations[]` —
+    // this is the public contract per verana-indexer#227. The legacy
+    // `dereferenceErrors[]` and `failedCredentials[]` arrays below are
+    // back-compat projections of the same data.
+    invalidPresentationsOut.push({
+      id: entry.vpUrl,
+      errorCode: entry.errorCode,
+      errorMessage: entry.errorMessage,
+      credentialIds: [...entry.credentialIds],
+      serviceId: entry.serviceId,
+      presentationType: entry.presentationType,
+    });
+
     if (isVpLevelFailure(entry)) {
       dereferenceErrors.push({
         vpUrl: entry.vpUrl,
@@ -279,6 +313,8 @@ export function buildTrustResult(
     credentials,
     failedCredentials,
     dereferenceErrors,
+    validPresentations: validPresentationsOut,
+    invalidPresentations: invalidPresentationsOut,
   };
 }
 
